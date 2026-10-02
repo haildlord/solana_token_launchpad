@@ -5,7 +5,6 @@ import { type User, type SafeUser } from "../interfaces/index.js";
 import { AppError } from "../errors/AppError.js";
 import { HttpStatus } from "../constants/index.js";
 
-
 export async function getUserByEmail(email : string) : Promise<User | null> {
     const result = await db.query<User>(`SELECT * FROM "user" WHERE email = $1`, [email]);
     return result.rows[0] ?? null;

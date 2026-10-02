@@ -36,3 +36,20 @@ await db.query(`create table if not exists launches(
     vesting JSONB
     )
 `);
+
+await db.query(`create table if not exists whitelists(
+    id serial primary key,
+    address text not null,
+    launchId integer references launches(id),
+    unique(address, launchId)
+)`);
+
+await db.query(`create table if not exists referrals(
+    id serial primary key,
+    launchId integer references launches(id) on delete cascade,
+    code text not null,
+    discountPercent numeric not null,
+    maxUses integer not null,
+    usedCount integer default 0,
+    unique(launchId, code)
+)`);

@@ -52,6 +52,28 @@ export interface ReturnLaunch {
     limit    : number
 }
 
+export interface WhitelistingPayload {
+    address : string[]
+}
+
+export interface WhitelistAddress{
+    id : number,
+    address : string,
+    launchId : number,
+}
+
+export interface ReferralPayload {
+    code: string;
+    discountPercent: number;
+    maxUses: number;
+}
+
+export interface Referral extends ReferralPayload {
+    id: number;
+    launchId: number;
+    usedCount: number;
+}
+
 export type LaunchStatus = "UPCOMING" | "ACTIVE" | "ENDED" | "SOLD_OUT";
 
 export type SafeUser = Omit<User, 'password'>;
