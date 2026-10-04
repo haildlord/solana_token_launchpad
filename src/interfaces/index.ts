@@ -31,6 +31,7 @@ export interface LaunchPayload {
     endsAt          : string | Date,
     maxPerWallet    : number,
     description     : string,
+    imageUrl?       : string | null | undefined,
     tiers?          : Tier[] | undefined,
     vesting?        : Vesting | undefined
 }
@@ -72,6 +73,25 @@ export interface Referral extends ReferralPayload {
     id: number;
     launchId: number;
     usedCount: number;
+}
+
+export interface PurchasedDetails {
+    id : number,
+    launchId : number,
+    txSignature : string,
+    userId      : number,
+    amount      : number,
+    walletAddress : string,
+    totalCost   : number
+}
+
+export interface VestingSchedule{
+    totalPurchased : number,
+    tgeAmount : number,
+    cliffEndsAt : Date | string | null, 
+    vestedAmount : number
+    lockedAmount : number
+    claimableAmount : number
 }
 
 export type LaunchStatus = "UPCOMING" | "ACTIVE" | "ENDED" | "SOLD_OUT";

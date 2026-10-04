@@ -2,7 +2,7 @@ import jwt from "jsonwebtoken";
 import { type TokenPayload } from "../interfaces/index.js";
 
 // 1. Guard against missing secret once at startup:
-const JWT_SECRET = process.env.SECRET || "default_development_secret_key";
+const JWT_SECRET = process.env.JWT_SECRET || process.env.SECRET || "default_development_secret_key";
 
 // 2. Sign tokens with expiration in one clean function:
 export function generateToken(payload: TokenPayload): string {

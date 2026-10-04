@@ -33,3 +33,5 @@ test-ledger/
 keypairs/
 *.json.key
 id.json
+# uploaded token images
+uploads/
