@@ -1,30 +1,37 @@
-import { Router } from "express";
+import { Hono, type Context } from "hono";
 import { authMiddleware } from "../middleware/index.js";
-import type { Launch, LaunchPayload, LaunchStatus, WhitelistAddress, PurchasedDetails, Referral } from "../interfaces/index.js";
+import type { LaunchPayload, LaunchStatus, LaunchWithStatus, Referral } from "../interfaces/index.js";
 import { AppError } from "../errors/AppError.js";
 import { HttpStatus } from "../constants/index.js";
-import { insertNewLaunch, computeLaunchStatus, getLaunches, getLaunchById, insertAddress, getWhitelistedAddresses, deleteAddressFromWhitelist, createReferralCode, getReferralsByLaunchId, getPurchaseDetails, getSumOfUserPurchases, recordPurchase, getUsersAllPurchasesPerLaunch, getAllPurchasesByLaunchId, getWalletPurchasedTotal, calculateVestingSchedule, updateLaunch, setLaunchImage } from "../services/launchService.js";
-import { uploadImage, removeSavedImage } from "../middleware/upload.js";
+import { insertNewLaunch, computeLaunchStatus, getLaunches, getLaunchById, insertAddress, getWhitelistedAddresses, deleteAddressFromWhitelist, createReferralCode, getReferralsByLaunchId, getReferralByCode, isTxSignatureUsed, getSumOfUserPurchases, recordPurchase, getUsersAllPurchasesPerLaunch, getAllPurchasesByLaunchId, getWalletPurchasedTotal, calculateVestingSchedule, updateLaunch, setLaunchImage, isWalletAllowed } from "../services/launchService.js";
+import { validateImage, saveImage, removeSavedImage } from "../services/imageService.js";
 import { validateLaunchFields, validateAddresses, validatePurchase } from "../utils/validators.js";
-import { type TokenPayload, type ReturnLaunch, type LaunchWithStatus } from "../interfaces/index.js";
+import { readJson, parseLaunchId } from "../utils/body.js";
+import type { AppEnv } from "../types.js";
 
-export const launchRoute = Router();
+export const launchRoute = new Hono<AppEnv>();
 
-
-launchRoute.post("/", authMiddleware, async (req, res, _next) => {
-
-    const userId : TokenPayload = (req as any).user;
-    if(!userId || userId.id === 0){
-        throw new AppError("Invalid Creator", HttpStatus.UNAUTHORIZED);
+// loads the launch (404 if missing) and makes sure the logged in user created it (403 if not)
+async function getOwnedLaunch(c : Context<AppEnv>, launch_id : number) : Promise<LaunchWithStatus> {
+    const launch = await getLaunchById(c.env.DB, launch_id);
+    if (c.get("user").id !== launch.creatorId) {
+        throw new AppError("Not authorized", HttpStatus.FORBIDDEN);
     }
+    return launch;
+}
 
-    const { name, symbol, totalSupply, pricePerToken, startsAt, endsAt, maxPerWallet, description, tiers, vesting, imageUrl } : LaunchPayload = req.body;
-    if(!name || !symbol || !totalSupply || !pricePerToken || !startsAt || !endsAt || !maxPerWallet || !description){
+launchRoute.post("/", authMiddleware, async (c) => {
+
+    const user = c.get("user");
+    const body = await readJson(c);
+
+    const { name, symbol, totalSupply, pricePerToken, startsAt, endsAt, maxPerWallet, description, tiers, vesting, imageUrl } : LaunchPayload = body;
+    if (!name || !symbol || !totalSupply || !pricePerToken || !startsAt || !endsAt || !maxPerWallet || !description) {
         throw new AppError("missing fields", HttpStatus.BAD_REQUEST);
     }
-    validateLaunchFields(req.body);
+    validateLaunchFields(body);
 
-    const payload = {
+    const result = await insertNewLaunch(c.env.DB, {
         name,
         symbol,
         totalSupply,
@@ -36,195 +43,117 @@ launchRoute.post("/", authMiddleware, async (req, res, _next) => {
         tiers,
         vesting,
         imageUrl
-    }
+    }, user.id);
 
-    const result : Launch  = await insertNewLaunch(payload, userId.id);
-
-    return res.status(HttpStatus.CREATED).json({
+    return c.json({
         ...result,
-        creatorId: userId.id,
+        creatorId: user.id,
         status: computeLaunchStatus(result)
-    });
-
+    }, HttpStatus.CREATED);
 });
 
-launchRoute.get("/", async(req, res) => {
-    
-    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
-    const limit = Math.max(1, parseInt(req.query.limit as string, 10) || 10);
-    const status = req.query.status as LaunchStatus | undefined;
+launchRoute.get("/", async (c) => {
 
-    const result : ReturnLaunch = await getLaunches(page, limit, status);
+    const page = Math.max(1, parseInt(c.req.query("page") ?? "", 10) || 1);
+    const limit = Math.max(1, parseInt(c.req.query("limit") ?? "", 10) || 10);
+    const status = c.req.query("status") as LaunchStatus | undefined;
 
-    return res.status(HttpStatus.OK).json(result);
+    const result = await getLaunches(c.env.DB, page, limit, status);
+    return c.json(result, HttpStatus.OK);
 });
 
-launchRoute.get("/:id", async (req, res) => {
-    const id = parseInt(req.params.id as string, 10);
-    
-    if (isNaN(id) || id <= 0) {
-        throw new AppError("Invalid launch ID", HttpStatus.BAD_REQUEST);
-    }
-
-    const launch = await getLaunchById(id);
-    return res.status(HttpStatus.OK).json(launch);
+launchRoute.get("/:id", async (c) => {
+    const launch = await getLaunchById(c.env.DB, parseLaunchId(c));
+    return c.json(launch, HttpStatus.OK);
 });
 
-launchRoute.put("/:id", authMiddleware, async (req, res) => {
-    const launch_id = parseInt(req.params.id as string, 10);
-    if (isNaN(launch_id) || launch_id <= 0) {
-        throw new AppError("Invalid launch ID", HttpStatus.BAD_REQUEST);
-    }
+launchRoute.put("/:id", authMiddleware, async (c) => {
+    const launch_id = parseLaunchId(c);
+    await getOwnedLaunch(c, launch_id);
 
-    const launch: LaunchWithStatus = await getLaunchById(launch_id);
-    if (!launch) {
-        throw new AppError("Launch not found", HttpStatus.NOT_FOUND);
-    }
+    const body = await readJson(c);
+    validateLaunchFields(body);
 
-    const { id: user_id } = (req as any).user as TokenPayload;
-    if (user_id !== launch.creatorId) {
-        throw new AppError("Not authorized", HttpStatus.FORBIDDEN);
-    }
-
-    validateLaunchFields(req.body);
-    const updated = await updateLaunch(launch_id, req.body);
-    return res.status(HttpStatus.OK).json(updated);
+    const updated = await updateLaunch(c.env.DB, launch_id, body);
+    return c.json(updated, HttpStatus.OK);
 });
 
 // Upload the token image. Send multipart/form-data with the file in a field called "image".
-launchRoute.post("/:id/image", authMiddleware, uploadImage, async (req, res) => {
-    const launch_id = parseInt(req.params.id as string, 10);
-    const file = req.file;
+launchRoute.post("/:id/image", authMiddleware, async (c) => {
+    const launch_id = parseLaunchId(c);
+    const launch = await getOwnedLaunch(c, launch_id);
 
-    // the file is already saved by multer, so remove it again if we end up rejecting the request
-    const reject = (message : string, status : number) : never => {
-        if (file) removeSavedImage("/uploads/" + file.filename);
-        throw new AppError(message, status);
-    };
-
-    if (isNaN(launch_id) || launch_id <= 0) reject("Invalid launch id", HttpStatus.BAD_REQUEST);
-
-    let launch : LaunchWithStatus;
+    let form;
     try {
-        launch = await getLaunchById(launch_id);
-    } catch (err) {
-        if (file) removeSavedImage("/uploads/" + file.filename);
-        throw err;
+        form = await c.req.parseBody();
+    } catch {
+        throw new AppError("Send the image as multipart/form-data", HttpStatus.BAD_REQUEST);
     }
 
-    const { id: user_id } = (req as any).user as TokenPayload;
-    if (user_id !== launch.creatorId) reject("Not authorized", HttpStatus.FORBIDDEN);
-    if (!file) reject("Image file is required", HttpStatus.BAD_REQUEST);
+    const file = form["image"];
+    if (!(file instanceof File)) {
+        throw new AppError("Image file is required", HttpStatus.BAD_REQUEST);
+    }
+    validateImage(file);
 
-    const updated = await setLaunchImage(launch_id, "/uploads/" + file!.filename);
-    removeSavedImage(launch.imageUrl);
+    const imageUrl = await saveImage(c.env.IMAGES, file);
+    const updated = await setLaunchImage(c.env.DB, launch_id, imageUrl);
+    await removeSavedImage(c.env.IMAGES, launch.imageUrl);
 
-    return res.status(HttpStatus.OK).json(updated);
+    return c.json(updated, HttpStatus.OK);
 });
 
-launchRoute.post("/:id/whitelist", authMiddleware, async (req, res) => {
-    
-    const launch_id = parseInt((req.params.id as string), 10);
-    if(!launch_id || launch_id === 0){
-        throw new AppError("Invalid launch id", HttpStatus.BAD_REQUEST);
-    }
-    
-    const launch : LaunchWithStatus = await getLaunchById(launch_id);
-    if(!launch){
-        throw new AppError("Launch not found", HttpStatus.NOT_FOUND);
-    }
+launchRoute.post("/:id/whitelist", authMiddleware, async (c) => {
+    const launch_id = parseLaunchId(c);
+    await getOwnedLaunch(c, launch_id);
 
-    const { id : creator_id } = (req as any).user as TokenPayload;
-    if(creator_id !== launch.creatorId){
-        throw new AppError("Not authorized", HttpStatus.FORBIDDEN);
-    }
+    const body = await readJson(c);
 
     // throws 400 unless it is a non empty array of strings
-    let addresses : string[] = validateAddresses(req.body.addresses);
+    let addresses : string[] = validateAddresses(body.addresses);
 
     // remvoes the duplicate address from addres
     addresses = Array.from(new Set(addresses));
 
-    const result : { added: number; total: number } = await insertAddress(launch_id, addresses);
-    return res.status(HttpStatus.OK).json(result)
+    const result = await insertAddress(c.env.DB, launch_id, addresses);
+    return c.json(result, HttpStatus.OK);
 });
 
-launchRoute.get("/:id/whitelist", authMiddleware, async (req, res) => {
+launchRoute.get("/:id/whitelist", authMiddleware, async (c) => {
+    const launch_id = parseLaunchId(c);
+    await getOwnedLaunch(c, launch_id);
 
-    const launch_id = parseInt((req.params.id as string), 10);
-    if(!launch_id || launch_id === 0){
-        throw new AppError("Invalid launch id", HttpStatus.BAD_REQUEST);
-    }
+    const result = await getWhitelistedAddresses(c.env.DB, launch_id);
+    const addresses : string[] = result.map((item) => item.address);
 
-    const launch : LaunchWithStatus = await getLaunchById(launch_id);
-    if(!launch){
-        throw new AppError("Launch not found", HttpStatus.NOT_FOUND);
-    }
-
-    const { id : creator_id } = (req as any).user as TokenPayload;
-    if(creator_id !== launch.creatorId){
-        throw new AppError("Not authorized", HttpStatus.FORBIDDEN);
-    }
-
-    const result : {address: string}[] = await getWhitelistedAddresses(launch_id);
-    const addresses : string[]  = result.map((item) => ( item.address ) );
-
-    return res.status(HttpStatus.OK).json({
+    return c.json({
         addresses,
         total : addresses.length
-    })
-}
-);
+    }, HttpStatus.OK);
+});
 
-launchRoute.delete("/:id/whitelist/:address", authMiddleware, async (req, res) => {
-
-    const address = (req.params.address as string);
+launchRoute.delete("/:id/whitelist/:address", authMiddleware, async (c) => {
+    const address = c.req.param("address");
     if (!address || address.trim() === "") {
         throw new AppError("Invalid address", HttpStatus.BAD_REQUEST);
     }
-    
-    const launch_id = parseInt((req.params.id as string), 10);
-    if(!launch_id || launch_id === 0){
-        throw new AppError("Invalid launch id", HttpStatus.BAD_REQUEST);
-    }
 
-    const launch : LaunchWithStatus = await getLaunchById(launch_id);
-    if(!launch){
-        throw new AppError("Launch not found", HttpStatus.NOT_FOUND);
-    }
+    const launch_id = parseLaunchId(c);
+    await getOwnedLaunch(c, launch_id);
 
-    const { id : creator_id } = (req as any).user as TokenPayload;
-    if(creator_id !== launch.creatorId){
-        throw new AppError("Not authorized", HttpStatus.FORBIDDEN);
-    }
-
-    const result : WhitelistAddress | undefined = await deleteAddressFromWhitelist(launch_id, address);
-    if(!result){
+    const result = await deleteAddressFromWhitelist(c.env.DB, launch_id, address);
+    if (!result) {
         throw new AppError("Unable to delete", HttpStatus.NOT_FOUND);
     }
 
-    return res.status(HttpStatus.OK).json({
-        removed: true
-    })
+    return c.json({ removed: true }, HttpStatus.OK);
 });
 
-launchRoute.post("/:id/referrals", authMiddleware, async (req, res) => {
-    const launch_id = parseInt(req.params.id as string, 10);
-    if (!launch_id || launch_id <= 0) {
-        throw new AppError("Invalid launch id", HttpStatus.BAD_REQUEST);
-    }
+launchRoute.post("/:id/referrals", authMiddleware, async (c) => {
+    const launch_id = parseLaunchId(c);
+    await getOwnedLaunch(c, launch_id);
 
-    const launch: LaunchWithStatus = await getLaunchById(launch_id);
-    if (!launch) {
-        throw new AppError("Launch not found", HttpStatus.NOT_FOUND);
-    }
-
-    const { id: creator_id } = (req as any).user as TokenPayload;
-    if (creator_id !== launch.creatorId) {
-        throw new AppError("Not authorized", HttpStatus.FORBIDDEN);
-    }
-
-    const { code, discountPercent, maxUses } = req.body;
+    const { code, discountPercent, maxUses } = await readJson(c);
     if (!code || typeof code !== "string" || code.trim() === "") {
         throw new AppError("Referral code is required", HttpStatus.BAD_REQUEST);
     }
@@ -237,108 +166,84 @@ launchRoute.post("/:id/referrals", authMiddleware, async (req, res) => {
         throw new AppError("maxUses must be a positive integer", HttpStatus.BAD_REQUEST);
     }
 
-    const referral = await createReferralCode(launch_id, {
+    const referral = await createReferralCode(c.env.DB, launch_id, {
         code: code.trim(),
         discountPercent,
         maxUses
     });
 
-    return res.status(HttpStatus.CREATED).json({
+    return c.json({
         id: referral.id,
         code: referral.code,
         discountPercent: referral.discountPercent,
         maxUses: referral.maxUses,
         usedCount: 0
-    });
+    }, HttpStatus.CREATED);
 });
 
-launchRoute.get("/:id/referrals", authMiddleware, async (req, res) => {
-    const launch_id = parseInt(req.params.id as string, 10);
-    if (!launch_id || launch_id <= 0) {
-        throw new AppError("Invalid launch id", HttpStatus.BAD_REQUEST);
-    }
+launchRoute.get("/:id/referrals", authMiddleware, async (c) => {
+    const launch_id = parseLaunchId(c);
+    await getOwnedLaunch(c, launch_id);
 
-    const launch: LaunchWithStatus = await getLaunchById(launch_id);
-    if (!launch) {
-        throw new AppError("Launch not found", HttpStatus.NOT_FOUND);
-    }
-
-    const { id: creator_id } = (req as any).user as TokenPayload;
-    if (creator_id !== launch.creatorId) {
-        throw new AppError("Not authorized", HttpStatus.FORBIDDEN);
-    }
-
-    const referrals = await getReferralsByLaunchId(launch_id);
-    return res.status(HttpStatus.OK).json(referrals);
+    const referrals = await getReferralsByLaunchId(c.env.DB, launch_id);
+    return c.json(referrals, HttpStatus.OK);
 });
 
-launchRoute.post("/:id/purchase", authMiddleware, async (req, res) => {
+launchRoute.post("/:id/purchase", authMiddleware, async (c) => {
 
-    const { id: user_id } = (req as any).user as TokenPayload;
-
-    if(!user_id || user_id === 0){
-        throw new AppError("Invalide User", HttpStatus.BAD_REQUEST);
-    }
-
-    const launch_id : number = parseInt(req.params.id as string, 10);
-    if(isNaN(launch_id) || launch_id === 0){
-        throw new AppError("Launch Not Found", HttpStatus.NOT_FOUND);
-    }
+    const { id: user_id } = c.get("user");
+    const launch_id = parseLaunchId(c);
+    const db = c.env.DB;
 
     // * throws error if Launch not found.
-    const launch : LaunchWithStatus  = await getLaunchById(launch_id);
+    const launch = await getLaunchById(db, launch_id);
     const launch_status : LaunchStatus = computeLaunchStatus(launch);
 
-    if(launch_status !== "ACTIVE"){
+    if (launch_status !== "ACTIVE") {
         throw new AppError(`Launch is not active, it is ${launch_status}`, HttpStatus.BAD_REQUEST);
     }
 
-    validatePurchase(req.body);
-    const { walletAddress, amount, txSignature, referralCode } : {walletAddress : string, amount : number, txSignature: string, referralCode : string} = req.body;
+    const body = await readJson(c);
+    validatePurchase(body);
+    const { walletAddress, amount, txSignature, referralCode } : { walletAddress : string, amount : number, txSignature : string, referralCode? : string } = body;
 
-    const whitelistedAddresses : {address: string}[]  = await getWhitelistedAddresses(launch_id);
-    if(whitelistedAddresses.length !== 0){
-
-        const isWhitelisted = whitelistedAddresses.some((item) => item.address === walletAddress);
-        if (!isWhitelisted) {
-            throw new AppError("Wallet not whitelisted", HttpStatus.BAD_REQUEST);
-        }
+    if (!(await isWalletAllowed(db, launch_id, walletAddress))) {
+        throw new AppError("Wallet not whitelisted", HttpStatus.BAD_REQUEST);
     }
 
-    if(launch.totalPurchased + amount > launch.totalSupply){
+    if (launch.totalPurchased + amount > launch.totalSupply) {
         throw new AppError("Exceeded the limit", HttpStatus.BAD_REQUEST);
     }
 
-    const purchaseDetails : PurchasedDetails | undefined = await getPurchaseDetails(launch_id, txSignature)
-    if(purchaseDetails){
+    if (await isTxSignatureUsed(db, txSignature)) {
         throw new AppError("Transaction already exists", HttpStatus.BAD_REQUEST);
     }
 
-    let foundRefferal : Referral | undefined = undefined;
+    let foundRefferal : Referral | null = null;
 
-    if(referralCode){
-        const refferalList : Referral[] = await getReferralsByLaunchId(launch_id);
-       foundRefferal = refferalList.find((item) => item.code === referralCode);
-        if(!foundRefferal){
+    if (referralCode) {
+        foundRefferal = await getReferralByCode(db, launch_id, referralCode);
+        if (!foundRefferal) {
             throw new AppError("Referral Code does not exist", HttpStatus.BAD_REQUEST);
         }
-    
-        if(foundRefferal.usedCount >= foundRefferal.maxUses){
+
+        if (foundRefferal.usedCount >= foundRefferal.maxUses) {
             throw new AppError("Referral lImit exceeded", HttpStatus.BAD_REQUEST);
         }
     }
 
-    const totalUserPurchased : number = await getSumOfUserPurchases(launch_id, user_id);
-    if(totalUserPurchased + amount > launch.maxPerWallet){
+    const totalUserPurchased = await getSumOfUserPurchases(db, launch_id, user_id);
+    if (totalUserPurchased + amount > launch.maxPerWallet) {
         throw new AppError("Not Authorized", HttpStatus.BAD_REQUEST);
     }
 
-    let totalCost : number = 0;
+    let totalCost = 0;
     let remaining = amount;
 
-    if(launch.tiers && launch.tiers.length > 0){
-        for(const tier of launch.tiers){
-            if(remaining <= 0) break;
+    // 1. Fill the tiers in order
+    if (launch.tiers && launch.tiers.length > 0) {
+        for (const tier of launch.tiers) {
+            if (remaining <= 0) break;
 
             const capacity = tier.maxAmount - tier.minAmount;
             const fill = Math.min(remaining, capacity);
@@ -355,7 +260,7 @@ launchRoute.post("/:id/purchase", authMiddleware, async (req, res) => {
         totalCost = totalCost * (1 - foundRefferal.discountPercent / 100);
     }
 
-    const purchase = await recordPurchase({
+    const purchase = await recordPurchase(db, {
         launchId: launch_id,
         userId: user_id,
         walletAddress,
@@ -365,51 +270,38 @@ launchRoute.post("/:id/purchase", authMiddleware, async (req, res) => {
         referralCode: foundRefferal?.code
     });
 
-    return res.status(HttpStatus.CREATED).json(purchase);
+    return c.json(purchase, HttpStatus.CREATED);
 });
 
-launchRoute.get("/:id/purchases", authMiddleware, async (req, res) => {
-    const launch_id = parseInt(req.params.id as string, 10);
-    if (isNaN(launch_id) || launch_id <= 0) {
-        throw new AppError("Invalid launch id", HttpStatus.BAD_REQUEST);
-    }
+launchRoute.get("/:id/purchases", authMiddleware, async (c) => {
+    const launch_id = parseLaunchId(c);
+    const launch = await getLaunchById(c.env.DB, launch_id);
 
-    const launch: LaunchWithStatus = await getLaunchById(launch_id);
-    if (!launch) {
-        throw new AppError("Launch not found", HttpStatus.NOT_FOUND);
-    }
-
-    const { id: user_id } = (req as any).user as TokenPayload;
+    const { id: user_id } = c.get("user");
     const isCreator = user_id === launch.creatorId;
 
     const purchases = isCreator
-        ? await getAllPurchasesByLaunchId(launch_id)
-        : await getUsersAllPurchasesPerLaunch(launch_id, user_id);
+        ? await getAllPurchasesByLaunchId(c.env.DB, launch_id)
+        : await getUsersAllPurchasesPerLaunch(c.env.DB, launch_id, user_id);
 
-    return res.status(HttpStatus.OK).json({
+    return c.json({
         purchases,
         total: purchases.length
-    });
+    }, HttpStatus.OK);
 });
 
-launchRoute.get("/:id/vesting", authMiddleware, async (req, res) => {
-    const launch_id = parseInt(req.params.id as string, 10);
-    if (isNaN(launch_id) || launch_id <= 0) {
-        throw new AppError("Invalid launch id", HttpStatus.BAD_REQUEST);
-    }
+launchRoute.get("/:id/vesting", authMiddleware, async (c) => {
+    const launch_id = parseLaunchId(c);
 
-    const walletAddress = req.query.walletAddress as string;
+    const walletAddress = c.req.query("walletAddress");
     if (!walletAddress || walletAddress.trim() === "") {
         throw new AppError("missing walletAddress", HttpStatus.BAD_REQUEST);
     }
 
-    const launch: LaunchWithStatus = await getLaunchById(launch_id);
-    if (!launch) {
-        throw new AppError("Launch not found", HttpStatus.NOT_FOUND);
-    }
+    const launch = await getLaunchById(c.env.DB, launch_id);
 
-    const totalPurchased = await getWalletPurchasedTotal(launch_id, walletAddress.trim());
+    const totalPurchased = await getWalletPurchasedTotal(c.env.DB, launch_id, walletAddress.trim());
     const schedule = calculateVestingSchedule(totalPurchased, launch);
 
-    return res.status(HttpStatus.OK).json(schedule);
+    return c.json(schedule, HttpStatus.OK);
 });

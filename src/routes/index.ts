@@ -1,16 +1,11 @@
-import {Router, type NextFunction, type Request, type Response} from "express";
+import { Hono } from "hono";
 import { HttpStatus } from "../constants/index.js";
 import { authRoute } from "./authRoutes.js";
-import {launchRoute} from "./launchRoutes.js";
+import { launchRoute } from "./launchRoutes.js";
+import type { AppEnv } from "../types.js";
 
-export const rootRouter = Router();
+export const rootRouter = new Hono<AppEnv>();
 
-function getHealth(_req : Request, res : Response, _next: NextFunction) {
-    return res.status(HttpStatus.OK).json({
-        status: "ok" 
-    });    
-}
-
-rootRouter.get("/health", getHealth);
-rootRouter.use("/auth", authRoute);
-rootRouter.use("/launches", launchRoute);
+rootRouter.get("/health", (c) => c.json({ status: "ok" }, HttpStatus.OK));
+rootRouter.route("/auth", authRoute);
+rootRouter.route("/launches", launchRoute);

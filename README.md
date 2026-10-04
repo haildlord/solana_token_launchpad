@@ -1,12 +1,14 @@
-# LordLaunch
+# LordLaunch (v1_hono)
 
 A token launchpad for Solana. Creators set up a token sale (price, supply, dates, whitelist, referral codes, tiered pricing, vesting). Buyers join the sale, and the platform keeps track of how much each person bought, what they paid, and how much of it they can claim over time.
 
-It is a full stack project:
+This branch is the **Cloudflare version**. The Express + PostgreSQL backend from `main` was rewritten with **Hono** so it runs on **Cloudflare Workers**, with **D1** as the database and **Workers KV** for token images. One Worker serves both the API and the React frontend.
 
-- **Backend:** Node.js + Express + PostgreSQL REST API, written in TypeScript
-- **Frontend:** React single page app (Vite)
-- **Tests:** 197 HTTP tests using Node's built in test runner
+- **Backend:** Hono + TypeScript on Cloudflare Workers
+- **Database:** Cloudflare D1 (SQLite)
+- **Images:** Cloudflare Workers KV
+- **Frontend:** React single page app (Vite), served by the same Worker
+- **Tests:** the same 197 HTTP tests as the Express version, all passing
 
 > **Important:** this project is the *platform side* of a launchpad (accounts, sale rules, bookkeeping). It does not talk to the Solana blockchain. Buyers paste a transaction signature and the server records it, but does not check it on chain. See [What a production launchpad adds](#what-a-production-launchpad-adds).
 
@@ -16,14 +18,16 @@ It is a full stack project:
 
 1. [Concepts I learned](#concepts-i-learned)
 2. [Architecture](#architecture)
-3. [Technology used](#technology-used)
-4. [API reference](#api-reference)
-5. [Database schema](#database-schema)
-6. [How to run it (step by step)](#how-to-run-it-step-by-step)
-7. [Running the tests](#running-the-tests)
-8. [Project structure](#project-structure)
-9. [What a production launchpad adds](#what-a-production-launchpad-adds)
-10. [Talking points](#talking-points)
+3. [Express vs Hono: what changed](#express-vs-hono-what-changed)
+4. [Technology used](#technology-used)
+5. [API reference](#api-reference)
+6. [Database schema](#database-schema)
+7. [Run it locally](#run-it-locally)
+8. [Deploy to Cloudflare](#deploy-to-cloudflare)
+9. [Running the tests](#running-the-tests)
+10. [Project structure](#project-structure)
+11. [What a production launchpad adds](#what-a-production-launchpad-adds)
+12. [Talking points](#talking-points)
 
 ---
 
@@ -156,67 +160,86 @@ If a launch has no vesting config, everything is claimable immediately.
 ## Architecture
 
 ```
- Browser (React, port 5173)
-        |
-        |  fetch('/api/...')            Vite dev server forwards /api and /uploads
-        v
- Express server (port 3000)
-        |
-        |   express.json  ->  routes  ->  middleware (auth, upload)  ->  handler
-        v
-   Routes layer       parse the request, check permissions, call services
-        |
-        v
-   Services layer     business rules + SQL (launchService, userService)
-        |
-        v
-   db.ts              one PostgreSQL connection, creates the tables on start
-        |
-        v
- PostgreSQL            users, launches, whitelists, referrals, purchases
-
- Uploaded images  ->  saved as files in ./uploads, the DB stores only the path
+                      https://lordlaunch.<your-subdomain>.workers.dev
+                                         |
+                                Cloudflare edge network
+                                         |
+              +--------------------------+---------------------------+
+              |                                                      |
+     /api/*  and  /uploads/*                                every other path
+              |                                                      |
+              v                                                      v
+   Worker (Hono app, src/index.ts)                    Static assets (frontend/dist)
+              |                                       React app, index.html for unknown paths
+              |  middleware: schema check, auth
+              v
+   Routes  ->  Services  ->  bindings
+                               |
+              +----------------+----------------+
+              |                                 |
+         env.DB  (D1, SQLite)             env.IMAGES  (Workers KV)
+         users, launches, whitelists,     image bytes, key = random file name
+         referrals, purchases
 ```
+
+`wrangler.jsonc` wires this up:
+
+- `assets` points at `frontend/dist`. `run_worker_first: ["/api/*", "/uploads/*"]` sends only those paths to the Worker. Everything else is served as a static file, and `not_found_handling: "single-page-application"` returns `index.html` for paths like `/launches/12`, so React Router can take over.
+- `d1_databases` gives the Worker `env.DB`.
+- `kv_namespaces` gives the Worker `env.IMAGES`.
+- `JWT_SECRET` is a secret, set with `wrangler secret put`, never stored in the repo.
 
 ### Request lifecycle
 
 Example: `POST /api/launches/12/purchase`
 
-1. `express.json()` turns the JSON body into `req.body`.
-2. The router matches `/api/launches/:id/purchase`.
-3. `authMiddleware` reads `Authorization: Bearer <token>`, verifies the JWT and puts `{ id, email }` on `req`. A bad token becomes a `401`.
-4. The handler loads the launch, checks it is `ACTIVE`, validates the body, checks the whitelist, supply, referral code, per user limit, then works out the price.
-5. `recordPurchase` inserts the row, adds to `totalPurchased` and bumps the referral `usedCount`.
-6. The handler answers `201` with the purchase.
-7. If anything throws an `AppError`, the central `errorHandler` turns it into a JSON response with the right status code.
-
-### Design decisions
-
-- **Layers:** routes handle HTTP, services handle rules and SQL. This keeps handlers short and makes the logic easy to find.
-- **`AppError` + central error handler:** any code can `throw new AppError(message, status)`. One place turns it into a response. Express 5 forwards errors from async handlers automatically.
-- **Computed status:** derived from dates and totals, never stored, so there is no job needed to "flip" a launch to ENDED.
-- **Validation in one file:** `src/utils/validators.ts` is used by create, update, whitelist and purchase routes.
-- **Passwords:** hashed with bcrypt (10 rounds). The plain password is never stored or returned.
-- **Auth:** stateless JWT, valid for 7 days. No session table needed.
-- **Numbers:** PostgreSQL `NUMERIC` comes back as a string by default. `db.ts` registers a parser so they arrive as JavaScript numbers.
-- **Column names:** PostgreSQL lowercases unquoted names (`creatorId` becomes `creatorid`). `db.ts` maps result columns back to camelCase.
+1. Cloudflare sees the path starts with `/api/`, so it runs the Worker instead of serving a file.
+2. `schemaMiddleware` makes sure the tables exist (only does real work on the first request of each Worker instance).
+3. Hono matches `/api/launches/:id/purchase`.
+4. `authMiddleware` reads `Authorization: Bearer <token>`, verifies the JWT with `hono/jwt` and stores the user with `c.set("user", ...)`. A bad token becomes a `401`.
+5. The handler loads the launch, checks it is `ACTIVE`, validates the body, checks the whitelist, supply, transaction signature, referral code and per user limit, then works out the price.
+6. `recordPurchase` runs one **D1 batch**: insert the purchase, add to `totalPurchased`, bump the referral `usedCount`. A batch is a transaction, so either all three happen or none do.
+7. The handler returns `201` with the purchase.
+8. Anything thrown as an `AppError` reaches `app.onError`, which turns it into a JSON response with the right status code.
 
 ### Where is the token image stored?
 
-In two places, on purpose:
-
 | Part | Where |
 | --- | --- |
-| The image file | the `uploads/` folder on the server, saved with a random name like `1d9cad46-....png` |
+| The image bytes | Workers KV (`env.IMAGES`), under a random key like `1d9cad46-....png`, with the content type saved as metadata |
 | The link to it | the `imageUrl` column of the `launches` table, for example `/uploads/1d9cad46-....png` |
 
-Express serves the folder at `/uploads/...`, so the browser can load the image from that path.
+`GET /uploads/:key` in `src/index.ts` reads the bytes from KV and returns them with the right `Content-Type` and a long cache header (the names are random and never reused, so they can be cached forever).
 
-Why not put the image *inside* the database? Image bytes make the database large and slow to back up, and the web server is much better at serving files. The usual production setup is object storage (S3, Cloudflare R2) with the same idea: the file lives in storage, the database keeps the link.
+Why KV and not R2? R2 is Cloudflare's real object storage and the better long term choice, but it has to be switched on in the dashboard with a payment method. KV works on the free plan with no setup, and a 2 MB logo fits easily. Moving to R2 later only touches `src/services/imageService.ts` and `wrangler.jsonc`.
 
-Rules enforced on upload: only the creator can upload; png, jpg, webp or gif only; 2 MB maximum; the server picks the file name (so nobody can overwrite another file); replacing an image deletes the old file.
+Same rules as the Express version: creator only, png / jpg / webp / gif, 2 MB maximum, the server picks the name, replacing an image deletes the old one.
 
-The `uploads/` folder is in `.gitignore`, so images are **not** in the GitHub repo. A fresh clone starts with no images, and the app shows a coloured tile with the token symbol instead.
+---
+
+## Express vs Hono: what changed
+
+The routes, rules, responses and status codes are the same. The test suite is the proof: the same 197 tests pass against both versions. What changed is everything that depended on Node.js or on a long running server.
+
+| Topic | Express version (`main`) | Hono version (this branch) |
+| --- | --- | --- |
+| Runtime | Node.js process that stays running | Cloudflare Worker: starts per request, no server to manage, runs close to the user |
+| Framework | `express.Router()`, `(req, res)` | `new Hono()`, one context `c` (`c.req`, `c.json`, `c.env`, `c.set/get`) |
+| Request body | `express.json()` fills `req.body` | `readJson(c)` reads it, empty body means `{}`, broken JSON means `400` |
+| Errors | error middleware `(err, req, res, next)` | `app.onError(errorHandler)` |
+| Database | PostgreSQL via `pg` | D1 (SQLite) via the `env.DB` binding |
+| Creating tables | on server start in `db.ts` | on the first request, `ensureSchema()` in `src/db/schema.ts` |
+| Column names | Postgres lowercased them, `db.ts` mapped them back | SQLite keeps `creatorId` as written, no mapping needed |
+| Numbers | `NUMERIC` came back as strings, needed a parser | `REAL` comes back as a number |
+| Dates | `TIMESTAMPTZ` and `NOW()` | ISO text in UTC (sorts correctly as text), the current time is passed in as a parameter |
+| JSON columns | `JSONB` | `TEXT`, parsed with `JSON.parse` when read |
+| Whitelist bulk insert | `unnest($2::text[])` | `INSERT OR IGNORE ... VALUES (?, ?), (?, ?)` in groups of 50 (D1 allows 100 parameters per query) |
+| Purchase write | 3 separate queries | 1 D1 batch, which is a transaction |
+| Password hashing | `bcryptjs` | PBKDF2 from Web Crypto (`crypto.subtle`), native and fast enough for the Workers CPU limit |
+| JWT | `jsonwebtoken` (needs Node crypto) | `hono/jwt` (Web Crypto) |
+| File upload | `multer` writes to `./uploads` | `c.req.parseBody()` gives a `File`, bytes go to KV |
+| Config and secrets | `.env` + `dotenv` | `wrangler.jsonc` bindings, `.dev.vars` locally, `wrangler secret put` in production |
+| Frontend hosting | separate Vite server | same Worker, from `frontend/dist` |
 
 ---
 
@@ -226,26 +249,24 @@ The `uploads/` folder is in `.gitignore`, so images are **not** in the GitHub re
 
 | Tool | What it is and why it is here |
 | --- | --- |
-| **Node.js** | JavaScript runtime. Runs the server outside the browser. |
-| **TypeScript** | JavaScript with types. Catches mistakes (a wrong field name, a missing value) before running. |
-| **tsx** | Runs TypeScript files directly, so there is no build step to start the server. |
-| **Express 5** | Web framework. Handles routing, middleware and JSON bodies on top of Node's `http` module. |
-| **HTTP / REST** | The server speaks HTTP. Each URL + method (`GET /api/launches`) is one action, and status codes tell the result: `200` ok, `201` created, `400` bad input, `401` not logged in, `403` not allowed, `404` not found, `409` conflict. |
-| **PostgreSQL** | Relational database. Good fit because the data has clear relations (a launch has many purchases) and money needs strict consistency. |
-| **pg** | The PostgreSQL client for Node. Queries use `$1, $2` placeholders, which prevents SQL injection. |
-| **JSON Web Token (jsonwebtoken)** | After login the server signs a token. The client sends it back on every request to prove who it is. |
-| **bcryptjs** | Hashes passwords with a salt so a leaked database does not leak passwords. |
-| **multer** | Reads `multipart/form-data` so the server can receive file uploads. |
-| **dotenv** | Loads secrets from a `.env` file into `process.env`. |
+| **Cloudflare Workers** | Serverless functions that run on Cloudflare's network in over 300 cities. No server to keep running, scales by itself, generous free tier. |
+| **Hono** | Small, fast web framework built on web standards (`Request`, `Response`, `fetch`). Same code can run on Workers, Bun, Deno or Node. |
+| **TypeScript** | JavaScript with types. `wrangler types` generates the types for the bindings (`env.DB`, `env.IMAGES`, `env.JWT_SECRET`). |
+| **Wrangler** | Cloudflare's command line tool: local dev server, creating D1 / KV, setting secrets, deploying. |
+| **D1** | Cloudflare's SQL database, based on SQLite. Queries use `?` placeholders, which prevents SQL injection. |
+| **Workers KV** | Global key value store. Used here for image bytes. |
+| **Web Crypto** | Built into the runtime. Used for password hashing (PBKDF2) and for signing JWTs. |
+| **hono/jwt** | Signs and verifies the login tokens. |
+| **HTTP / REST** | Each URL + method is one action. Status codes: `200` ok, `201` created, `400` bad input, `401` not logged in, `403` not allowed, `404` not found, `409` conflict. |
 
 ### Frontend
 
 | Tool | What it is and why it is here |
 | --- | --- |
 | **React 19** | UI library. The screen is built from small components that re render when state changes. |
-| **Vite** | Dev server and build tool. Very fast reloads. Also proxies `/api` to the backend during development. |
+| **Vite** | Dev server and build tool. `npm run build` produces `frontend/dist`, which the Worker serves. |
 | **React Router** | Client side routing: pages change without a full reload. |
-| **Context API** | Shares the logged in user and toast messages across the app without passing props everywhere. |
+| **Context API** | Shares the logged in user and toast messages across the app. |
 | **Plain CSS** | One stylesheet with CSS variables. No UI library. |
 
 ### Testing
@@ -253,7 +274,7 @@ The `uploads/` folder is in `.gitignore`, so images are **not** in the GitHub re
 | Tool | What it is and why it is here |
 | --- | --- |
 | **node:test** | Test runner built into Node. No extra package. |
-| **fetch** | The tests call the real running server over HTTP, so they test routing, auth, validation and the database together. |
+| **fetch** | The tests call the running Worker over HTTP, so routing, auth, validation and the database are tested together. |
 
 ---
 
@@ -278,12 +299,13 @@ Routes marked **auth** need the header `Authorization: Bearer <token>`.
 | GET | `/api/launches/:id` | public. `404` if missing |
 | PUT | `/api/launches/:id` | **auth**, creator only (`403` for others) |
 | POST | `/api/launches/:id/image` | **auth**, creator only. `multipart/form-data` with a file in the field `image` |
+| GET | `/uploads/:key` | public. The image itself |
 
 ### Whitelist and referrals (creator only)
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| POST | `/api/launches/:id/whitelist` | body `{ addresses: string[] }` -> `{ added, total }` |
+| POST | `/api/launches/:id/whitelist` | body `{ addresses: string[] }` (up to 1000 at a time) -> `{ added, total }` |
 | GET | `/api/launches/:id/whitelist` | `{ addresses, total }` |
 | DELETE | `/api/launches/:id/whitelist/:address` | `{ removed: true }` or `404` |
 | POST | `/api/launches/:id/referrals` | body `{ code, discountPercent, maxUses }` -> `201`. `409` duplicate code |
@@ -303,139 +325,133 @@ A purchase returns `400` when the launch is not `ACTIVE`, the wallet is not whit
 
 ## Database schema
 
-The tables are created automatically when the server starts (`src/config/db.ts`).
+The Worker creates the tables itself on the first request (`src/db/schema.ts`), so a brand new D1 database needs no migration step and starts empty.
 
 ```
-"user"          id, email (unique), name, password (bcrypt hash)
+users           id, email (unique), name, password (PBKDF2 hash)
 
-launches        id, creatorId -> user, name, symbol (unique), totalSupply,
-                totalPurchased, pricePerToken, startsAt, endsAt, maxPerWallet,
-                description, imageUrl, tiers (JSONB), vesting (JSONB)
+launches        id, creatorId -> users, name, symbol (unique), description,
+                totalSupply, totalPurchased, pricePerToken, startsAt, endsAt,
+                maxPerWallet, tiers (JSON text), vesting (JSON text), imageUrl
 
 whitelists      id, launchId -> launches, address          unique(address, launchId)
 
 referrals       id, launchId -> launches, code, discountPercent, maxUses, usedCount
                                                             unique(launchId, code)
 
-purchases       id, launchId -> launches, userId -> user, walletAddress, amount,
+purchases       id, launchId -> launches, userId -> users, walletAddress, amount,
                 totalCost, txSignature (unique)
 ```
 
-Notes:
+Plus indexes on `whitelists(launchId)`, `purchases(launchId, userId)` and `purchases(launchId, walletAddress)`, the columns the purchase checks search by.
 
-- `tiers` and `vesting` are **JSONB** columns: flexible structured data stored inside one row. A good fit since they are always read together with the launch.
-- `unique(...)` constraints are the last line of defence against duplicates, even if two requests arrive at the same moment.
-- The user table is named `"user"` (quoted) because `user` is a reserved word in PostgreSQL.
+Dates are stored as ISO strings in UTC, for example `2026-10-04T10:00:00.000Z`. Because every value has the same format, comparing them as text gives the same answer as comparing them as times, which is how the status filter works in SQL.
 
 ---
 
-## How to run it (step by step)
+## Run it locally
 
-### What you need first
+You do not need a Cloudflare account for this. `wrangler dev` runs the Worker on your machine with a local copy of D1 and KV (stored in `.wrangler/`), so nothing touches the real database.
+
+### What you need
 
 - **Git**
 - **Node.js** 20.19 or newer (22+ recommended). Check with `node -v`
-- **PostgreSQL** 14 or newer, running on your machine. Check with `psql --version`
 
-### 1. Clone the project
+### Steps
 
 ```bash
+# 1. get the code on this branch
 git clone <your-github-repo-url>
 cd solana_token_launchpad
-```
+git switch v1_hono
 
-### 2. Create the database
-
-The server creates the *tables* itself, but the *database* must exist first. Open the PostgreSQL shell:
-
-```bash
-psql -U postgres
-```
-
-Then run:
-
-```sql
-CREATE DATABASE token_launchpad;
-\q
-```
-
-(On macOS with Homebrew you can also run `createdb token_launchpad`.)
-
-### 3. Create the `.env` file
-
-Copy the example file and edit it:
-
-```bash
-cp .env.example .env
-```
-
-Open `.env` and fill it in:
-
-```
-# Your PostgreSQL password for the "postgres" user
-DB_PASSWORD=your_password_here
-
-# Any long random text. It signs the login tokens.
-JWT_SECRET=change-me-to-a-long-random-string
-```
-
-Optional: instead of `DB_PASSWORD` you can give one full connection string. If `DATABASE_URL` is set it wins:
-
-```
-DATABASE_URL=postgresql://postgres:your_password_here@localhost:5432/token_launchpad
-```
-
-### 4. Install and start the backend
-
-```bash
+# 2. install (this also installs the frontend, through the postinstall script)
 npm install
-npm start
-```
 
-You should see `Server listening on... 3000`. On the first start it creates the tables. Check it:
+# 3. local secret for signing login tokens
+cp .dev.vars.example .dev.vars
 
-```bash
-curl http://localhost:3000/api/health
-# {"status":"ok"}
-```
-
-Leave this terminal running.
-
-### 5. Install and start the frontend
-
-Open a **second terminal**:
-
-```bash
-cd frontend
-npm install
+# 4. build the frontend and start the Worker
 npm run dev
 ```
 
-Open **http://localhost:5173** in your browser.
+Open **http://localhost:3000**. That is the full app: the React pages and the API from one Worker, the same way it runs on Cloudflare.
 
-### 6. Try it
+For frontend work with instant reload, keep `npm run dev` running and in a second terminal run `cd frontend && npm run dev`, then open http://localhost:5173. Vite forwards `/api` and `/uploads` to port 3000.
 
-1. Click **Sign up** and make an account.
-2. Click **Create launch**, add an image, fill the form, and submit.
-3. On the launch page, use the **Buy tokens** form. The wallet address and transaction signature can be any text for testing (the server does not check them on chain).
-4. Open the **Manage** tab to add whitelist addresses or a referral code, then buy again to see them work.
-5. Use the **Vesting** tab to look up a wallet.
+---
+
+## Deploy to Cloudflare
+
+### One time setup
+
+Already done for this project, listed so you know what exists and how to repeat it on another account:
+
+```bash
+npx wrangler login                                   # opens the browser to log in
+npx wrangler d1 create lordlaunch-db                 # the database
+npx wrangler kv namespace create lordlaunch-images   # the image store
+```
+
+Each `create` command prints an id. Those ids go into `wrangler.jsonc` under `d1_databases` and `kv_namespaces`. This branch already contains the ids of `lordlaunch-db` and `lordlaunch-images`.
+
+### Deploy
+
+```bash
+# 1. make sure you are logged in to the right account
+npx wrangler whoami
+
+# 2. build the frontend and upload everything
+npm run deploy
+```
+
+Wrangler prints the address, for example `https://lordlaunch.<your-subdomain>.workers.dev`.
+
+```bash
+# 3. set the secret that signs login tokens (do this once)
+openssl rand -hex 32
+npx wrangler secret put JWT_SECRET
+```
+
+Paste the random text from `openssl` when `wrangler secret put` asks for the value. Secrets apply right away, no redeploy needed.
+
+### Check it
+
+```bash
+curl https://lordlaunch.<your-subdomain>.workers.dev/api/health
+# {"status":"ok"}
+```
+
+Open the address in a browser, sign up, and create a launch. The first API request creates the tables. The database starts with no users and no launches.
+
+### Updating later
+
+Change the code, then `npm run deploy` again. The tables and data stay.
+
+### Useful commands
+
+```bash
+npx wrangler tail                       # live logs from the deployed Worker
+npx wrangler d1 execute lordlaunch-db --remote --command "SELECT id, email FROM users"
+npx wrangler d1 execute lordlaunch-db --remote --command "SELECT COUNT(*) FROM launches"
+```
 
 ### Common problems
 
 | Problem | Fix |
 | --- | --- |
-| `ECONNREFUSED` in the Vite terminal, or "Cannot reach the server" in the browser | The backend is not running. Start it with `npm start` in the project root. |
-| `password authentication failed for user "postgres"` | `DB_PASSWORD` in `.env` is wrong. |
-| `database "token_launchpad" does not exist` | Do step 2. |
-| `Port 3000 is already in use` | Another program is using port 3000. Stop it, or find it with `lsof -i :3000`. |
-| Images are missing after cloning | Expected. Uploaded files are not in git. Upload them again. |
+| `{"success":false,"message":"JWT_SECRET is not set"}` | Run `npx wrangler secret put JWT_SECRET` (deploy step 3). |
+| `The directory specified by the "assets.directory" field does not exist` | Build the frontend first: `npm run build` (`npm run deploy` and `npm run dev` already do it). |
+| Error 1102 "Worker exceeded resource limits" on sign up or log in | The free plan allows about 10 ms of CPU per request and password hashing is slow on purpose. It fits in tests, but if this shows up, lower `ITERATIONS` in `src/utils/password.ts` or move to the Workers Paid plan. |
+| Locally: `Address already in use` on port 3000 | Something else uses port 3000 (maybe the Express version). Stop it first. |
+| `Please enable R2` | Not needed, this project uses KV for images. |
 
 ---
 
 ## Running the tests
 
-The tests call a running server, so start the backend first (step 4), then in another terminal, from the project root:
+The tests call a running server. Start the Worker locally (`npm run dev`), then in a second terminal:
 
 ```bash
 npm test
@@ -443,34 +459,34 @@ npm test
 
 197 tests cover: health, register and login, token checks, creating / listing / updating launches, status and filters, paging, whitelist, referrals, purchases (tiers, discounts, limits, Sybil rule, duplicates), vesting, and image upload.
 
-Each test makes its own random users and launches, so the suite can run again and again. The side effect: **test data stays in the database**. Use a separate database if you do not want that.
+They run against the **local** D1 database, so the deployed database is never touched. To run them against a deployed Worker instead (this fills its database with test data):
+
+```bash
+BASE_URL=https://lordlaunch.<your-subdomain>.workers.dev npm test
+```
 
 ---
 
 ## Project structure
 
 ```
-solana_token_launchpad/
-├── src/                        backend
-│   ├── index.ts                starts Express, mounts routes, serves /uploads
-│   ├── config/db.ts            PostgreSQL connection + table creation
+solana_token_launchpad/   (branch v1_hono)
+├── src/                        the Worker
+│   ├── index.ts                Hono app: mounts /api, serves /uploads, error handler
+│   ├── types.ts                AppEnv: bindings + per request variables
+│   ├── db/schema.ts            CREATE TABLE statements, run on first request
 │   ├── routes/                 HTTP layer (auth, launches, health)
-│   ├── services/               business rules and SQL
-│   ├── middleware/             auth check, error handler, image upload
-│   ├── utils/                  jwt helpers, input validators
+│   ├── services/               business rules and SQL, image storage
+│   ├── middleware/             auth check, schema check, error handler
+│   ├── utils/                  jwt, password hashing, body parsing, validators
 │   ├── errors/AppError.ts      error type with an HTTP status
 │   ├── interfaces/             TypeScript types
 │   └── constants/              HTTP status codes
+├── frontend/                   React app (built into frontend/dist)
 ├── tests/                      API tests (one file per area)
-├── frontend/                   React app
-│   └── src/
-│       ├── pages/              Launches, LaunchDetail, CreateLaunch, auth pages
-│       ├── components/         Navbar, LaunchRow, BuyPanel, ManagePanel, ...
-│       ├── api.js              every call to the backend
-│       ├── auth.jsx            login state (Context)
-│       └── styles.css
-├── uploads/                    saved token images (not in git)
-├── .env.example                template for your .env
+├── wrangler.jsonc              Worker config: assets, D1, KV, dev port
+├── worker-configuration.d.ts   types generated by `npm run cf-typegen`
+├── .dev.vars.example           template for local secrets
 └── package.json
 ```
 
@@ -478,7 +494,7 @@ solana_token_launchpad/
 
 ## What a production launchpad adds
 
-This project covers the web platform. A real launchpad also needs the on chain part. Knowing the gap is part of understanding the topic.
+This project covers the web platform. A real launchpad also needs the on chain part.
 
 | This project | Production version |
 | --- | --- |
@@ -488,42 +504,40 @@ This project covers the web platform. A real launchpad also needs the on chain p
 | "Claimable" is calculated | An on chain **vesting program** (written with Anchor, or a service like Streamflow) actually holds the tokens and releases them. Users **claim** with a transaction |
 | Token is not created here | Creator mints an **SPL token**, and the sale program distributes it to buyers' token accounts |
 | Whitelist is a table | Often a **Merkle tree** root stored on chain, so the program can check membership cheaply |
-| One database connection | Connection pool and database transactions, so two buyers racing for the last tokens cannot oversell |
-| Local `uploads/` folder | Object storage (S3, R2) or decentralised storage (IPFS/Arweave), plus token metadata (name, symbol, image) following the Metaplex standard |
+| Checks run, then the write runs | The supply and per user checks would run inside the same transaction as the write, so two buyers racing for the last tokens cannot oversell |
+| Images in Workers KV | R2 object storage, or decentralised storage (IPFS/Arweave), plus token metadata (name, symbol, image) following the Metaplex standard |
 | No soft or hard cap | **Soft cap** (minimum to raise, otherwise refund) and **hard cap** (maximum) |
 
 ---
 
 ## Talking points
 
-Short answers to questions you might be asked.
-
 **What is a launchpad?**
 A platform that runs the first public sale of a token, with rules like time windows, limits per person, allowlists and vesting.
 
 **What is vesting and why use it?**
-Releasing tokens over time instead of all at once. It stops early buyers from dumping everything immediately and shows the team is committed. Parts: TGE unlock, a cliff, then linear release.
-
-**What is a cliff?**
-A waiting period. Nothing from the linear schedule unlocks until the cliff ends, then unlocking starts.
+Releasing tokens over time instead of all at once. It stops early buyers from dumping everything immediately. Parts: TGE unlock, a cliff, then linear release.
 
 **What is a Sybil attack and how did you handle it?**
 One person using many identities to get around limits. I count `maxPerWallet` per user account across all wallets, not per wallet address.
 
 **Why is `status` computed instead of stored?**
-It depends on the current time and on how much has sold. Storing it would need a background job to keep it correct. Computing it each time is always right.
+It depends on the current time and on how much has sold. Computing it each time means it is always right without a background job.
 
-**How does login work?**
-The password is checked with bcrypt, then the server signs a JWT. The client sends it in the `Authorization` header and middleware verifies it on every protected route. The server keeps no session.
+**Why move from Express to Hono on Workers?**
+No server to keep running or patch, it scales by itself, it runs close to users worldwide, and the free tier covers a project like this. Hono uses web standard `Request` and `Response`, so the code is not tied to Node.
+
+**What was hard about the move?**
+Anything that needed Node or a disk: `pg`, `bcryptjs`, `jsonwebtoken`, `multer` and the `uploads/` folder. They were replaced with D1, Web Crypto PBKDF2, `hono/jwt` and KV. SQL also changed from Postgres to SQLite (types, `NOW()`, `unnest`).
+
+**How did you know the rewrite still works?**
+The same 197 HTTP tests pass against both versions, because they only talk to the API over HTTP and do not care what runs behind it.
+
+**Why is the image not in the database?**
+Databases are for structured data. The bytes live in KV (R2 in a bigger setup) and the database keeps only the link.
 
 **How do you stop SQL injection?**
-All queries use parameter placeholders (`$1`), so user input is sent as data and never joined into the SQL text.
+All queries use `?` placeholders with `.bind(...)`, so user input is sent as data, never as part of the SQL text.
 
-**Why PostgreSQL?**
-The data is relational and involves money, so I want constraints (unique transaction signatures, foreign keys) enforced by the database itself.
-
-**Where do the images go?**
-The file is saved in `uploads/`, and the database stores only its path. Databases are for structured data, not for large files.
-
-**Does it talk to Solana?**
-Not yet. It records purchases and does the sale maths. The next step would be wallet connection and on chain verification of the payment (see the production table above).
+**How does login work?**
+The password is checked against a PBKDF2 hash, then the Worker signs a JWT. The client sends it in the `Authorization` header and middleware verifies it on every protected route. There is no session storage.

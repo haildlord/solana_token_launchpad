@@ -1,32 +1,25 @@
 {
-  "name": "solana_token_launchpad",
+  "name": "lordlaunch",
   "version": "1.0.0",
-  "description": "",
-  "main": "dist/index.js",
+  "description": "LordLaunch token launchpad - Hono API on Cloudflare Workers",
+  "private": true,
+  "type": "module",
   "scripts": {
-    "build": "npx tsc",
-    "start": "tsx src/index.ts",
+    "postinstall": "npm --prefix frontend install",
+    "build": "npm --prefix frontend run build",
+    "dev": "npm run build && wrangler dev",
+    "start": "npm run dev",
+    "deploy": "npm run build && wrangler deploy --minify",
+    "cf-typegen": "wrangler types",
+    "typecheck": "tsc --noEmit",
     "test": "node --test \"tests/*.test.js\""
   },
-  "keywords": [],
-  "author": "",
   "license": "ISC",
-  "type": "module",
-  "devDependencies": {
-    "@types/node": "^26.6.3",
-    "tsx": "^4.23.15",
-    "typescript": "^7.0.2"
-  },
   "dependencies": {
-    "@types/express": "^5.0.6",
-    "@types/jsonwebtoken": "^9.0.10",
-    "@types/multer": "^2.3.0",
-    "@types/pg": "^8.23.1",
-    "bcryptjs": "^3.0.3",
-    "dotenv": "^18.0.4",
-    "express": "^5.2.1",
-    "jsonwebtoken": "^9.0.3",
-    "multer": "^2.4.0",
-    "pg": "^8.23.0"
+    "hono": "^4.13.13"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "wrangler": "^4.147.0"
   }
 }

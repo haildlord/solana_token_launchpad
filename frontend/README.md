@@ -4,9 +4,9 @@ React app for the launchpad API. Built with Vite, React and React Router.
 
 ## Run it
 
-1. Start the backend from the project root (it listens on port 3000):
+1. Start the Worker from the project root (it listens on port 3000):
 
-       npm start
+       npm run dev
 
 2. In a second terminal:
 
@@ -25,8 +25,8 @@ If the backend is on another address, set `VITE_BACKEND_URL`:
 
     npm run build
 
-The files end up in `frontend/dist`. Serve them from any static host and send `/api` and
-`/uploads` to the backend.
+The files end up in `frontend/dist`. On this branch the Cloudflare Worker serves them, so
+`npm run deploy` in the project root builds and uploads the frontend together with the API.
 
 ## Pages
 

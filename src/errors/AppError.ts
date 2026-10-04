@@ -13,7 +13,8 @@ export class AppError extends Error {
      
 
       Object.setPrototypeOf(this, new.target.prototype);
-      Error.captureStackTrace(this, this.constructor);
+      // V8 has captureStackTrace, but the Workers types do not list it
+      (Error as any).captureStackTrace?.(this, this.constructor);
     }
   }
  

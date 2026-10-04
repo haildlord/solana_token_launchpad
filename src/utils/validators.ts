@@ -71,6 +71,7 @@ export function validateLaunchFields(body : any) : void {
 
 export function validateAddresses(addresses : unknown) : string[] {
     if (!Array.isArray(addresses) || addresses.length === 0) bad("addresses must be a non empty array");
+    if (addresses.length > 1000) bad("you can add at most 1000 addresses at a time");
     if (!addresses.every((item) => isText(item))) bad("every address must be a non empty string");
     return addresses.map((item : string) => item.trim());
 }

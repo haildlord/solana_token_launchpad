@@ -1,0 +1,44 @@
+/**
+ * Cloudflare Worker config for LordLaunch.
+ * One Worker serves both the API (/api/*, /uploads/*) and the React app (frontend/dist).
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "lordlaunch",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-09-01",
+	"observability": {
+		"enabled": true
+	},
+
+	// The built React app. Requests for /api/* and /uploads/* go to the Worker first,
+	// everything else is a static file, and unknown paths fall back to index.html
+	"assets": {
+		"directory": "./frontend/dist",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": ["/api/*", "/uploads/*"]
+	},
+
+	// SQLite database. Tables are created by the Worker on first use (src/db/schema.ts)
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "lordlaunch-db",
+			"database_id": "c01aae05-b432-4787-925b-4da56db2386d"
+		}
+	],
+
+	// Key value store that holds the uploaded token images
+	"kv_namespaces": [
+		{
+			"binding": "IMAGES",
+			"id": "6c63099f16fb4612b44d9918d852df60"
+		}
+	],
+
+	// same port as the Express version, so the frontend proxy and the tests work unchanged
+	"dev": {
+		"port": 3000
+	}
+}

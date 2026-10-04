@@ -1,46 +1,67 @@
- import { type LaunchPayload, type Launch, type LaunchStatus, type ReturnLaunch, type LaunchWithStatus, type WhitelistAddress, type ReferralPayload, type Referral, type PurchasedDetails, type Tier, type VestingSchedule } from "../interfaces/index.js";
- import { type QueryResult } from "pg";
- import { AppError } from "../errors/AppError.js";
- import { HttpStatus } from "../constants/index.js";
- import {db} from "../config/db.js";
+import { type LaunchPayload, type Launch, type LaunchStatus, type ReturnLaunch, type LaunchWithStatus, type WhitelistAddress, type ReferralPayload, type Referral, type PurchasedDetails, type VestingSchedule } from "../interfaces/index.js";
+import { AppError } from "../errors/AppError.js";
+import { HttpStatus } from "../constants/index.js";
+
+// D1 keeps tiers and vesting as JSON text, so rows need a small conversion on the way out
+type LaunchRow = Omit<Launch, "tiers" | "vesting"> & { tiers : string | null, vesting : string | null };
+
+function toLaunch(row : LaunchRow) : Launch {
+    return {
+        ...row,
+        tiers   : row.tiers ? JSON.parse(row.tiers) : null,
+        vesting : row.vesting ? JSON.parse(row.vesting) : null
+    };
+}
+
+function withStatus(row : LaunchRow) : LaunchWithStatus {
+    const launch = toLaunch(row);
+    return { ...launch, status: computeLaunchStatus(launch) };
+}
+
+// dates are stored as ISO strings in UTC so they can be compared as text in SQL
+function toIso(value : string | Date) : string {
+    return new Date(value).toISOString();
+}
+
+function isUniqueError(err : unknown) : boolean {
+    return err instanceof Error && err.message.includes("UNIQUE constraint failed");
+}
 
  // * insertNewLaunch : throws if unable to insert the launch
-export async function insertNewLaunch(payload : LaunchPayload, userId : number) : Promise<Launch> {
+export async function insertNewLaunch(db : D1Database, payload : LaunchPayload, userId : number) : Promise<Launch> {
     const { name, symbol, totalSupply, pricePerToken, startsAt, endsAt, maxPerWallet, description, tiers, vesting, imageUrl } = payload;
 
-    let insertedLaunch : QueryResult<Launch>;
+    let row : LaunchRow | null;
     try {
-    insertedLaunch = await db.query(
-        `INSERT INTO "launches" (creatorId, name, symbol, description, totalSupply, pricePerToken, startsAt, endsAt, maxPerWallet, tiers, vesting, imageUrl) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
-         RETURNING *`,
-        [
+        row = await db.prepare(
+            `INSERT INTO launches (creatorId, name, symbol, description, totalSupply, pricePerToken, startsAt, endsAt, maxPerWallet, tiers, vesting, imageUrl)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             RETURNING *`
+        ).bind(
             userId,
             name,
             symbol,
             description,
             totalSupply,
             pricePerToken,
-            startsAt,
-            endsAt,
+            toIso(startsAt),
+            toIso(endsAt),
             maxPerWallet,
             tiers ? JSON.stringify(tiers) : null,
             vesting ? JSON.stringify(vesting) : null,
             imageUrl ?? null
-        ]
-    );
-    } catch (err : any) {
-        if (err.code === "23505") {
+        ).first<LaunchRow>();
+    } catch (err) {
+        if (isUniqueError(err)) {
             throw new AppError("A launch with this symbol already exists", HttpStatus.CONFLICT);
         }
         throw err;
     }
 
-    if(insertedLaunch.rows[0]){
-        return insertedLaunch.rows[0];
+    if (!row) {
+        throw new AppError("Could not insert Launch", HttpStatus.INTERNAL_SERVER_ERROR);
     }
-
-    throw new AppError("Could not insert Launch", HttpStatus.INTERNAL_SERVER_ERROR);
+    return toLaunch(row);
 }
 
 export function computeLaunchStatus(launch : {
@@ -72,283 +93,218 @@ export function computeLaunchStatus(launch : {
     return "ACTIVE";
 }
 
-export async function getLaunches(page: number = 1, limit: number = 10, status? : LaunchStatus) : Promise<ReturnLaunch>{
-    
+export async function getLaunches(db : D1Database, page : number = 1, limit : number = 10, status? : LaunchStatus) : Promise<ReturnLaunch> {
+
     // These conditions follow the same order as computeLaunchStatus: SOLD_OUT is checked
     // first, so a sold out launch never shows up under UPCOMING, ACTIVE or ENDED.
+    // Postgres had NOW(), here we pass the current time in as a parameter.
+    const now = new Date().toISOString();
     let whereClause = "";
+    let params : unknown[] = [];
 
     if (status === "SOLD_OUT") {
         whereClause = "WHERE totalPurchased >= totalSupply";
     } else if (status === "UPCOMING") {
-        whereClause = "WHERE totalPurchased < totalSupply AND startsAt > NOW()";
+        whereClause = "WHERE totalPurchased < totalSupply AND startsAt > ?";
+        params = [now];
     } else if (status === "ACTIVE") {
-        whereClause = "WHERE totalPurchased < totalSupply AND startsAt <= NOW() AND endsAt >= NOW()";
+        whereClause = "WHERE totalPurchased < totalSupply AND startsAt <= ? AND endsAt >= ?";
+        params = [now, now];
     } else if (status === "ENDED") {
-        whereClause = "WHERE totalPurchased < totalSupply AND startsAt <= NOW() AND endsAt < NOW()";
+        whereClause = "WHERE totalPurchased < totalSupply AND startsAt <= ? AND endsAt < ?";
+        params = [now, now];
     }
-    
+
     const offset = Math.max(0, (page - 1) * limit);
-    
-    const query = `
-        SELECT * FROM launches 
-        ${whereClause} 
-        ORDER BY id DESC 
-        LIMIT $1 OFFSET $2
-    `;
-    
-    const result : QueryResult<Launch> = await db.query(query, [limit, offset]);
-    const countResult = await db.query(`SELECT COUNT(*) FROM launches ${whereClause}`);
 
-    let resultWithStatus : LaunchWithStatus[] = result.rows.map((item : Launch) => (
-        {
-            ...item,
-            status : computeLaunchStatus(item),
-        }
-    ))
+    // batch sends both queries in one round trip
+    const [list, count] = await db.batch([
+        db.prepare(`SELECT * FROM launches ${whereClause} ORDER BY id DESC LIMIT ? OFFSET ?`).bind(...params, limit, offset),
+        db.prepare(`SELECT COUNT(*) AS count FROM launches ${whereClause}`).bind(...params)
+    ]);
 
+    const launches = (list!.results as LaunchRow[]).map(withStatus);
+    const total = Number((count!.results[0] as { count : number }).count);
 
-    const total = parseInt(countResult.rows[0].count, 10);
-
-    return { launches : resultWithStatus, total, page, limit};
+    return { launches, total, page, limit };
 }
 
-export async function getLaunchById(id: number): Promise<LaunchWithStatus> {
-
-    const result: QueryResult<Launch> = await db.query(
-        "SELECT * FROM launches WHERE id = $1",
-        [id]
-    );
-
-    const launch = result.rows[0];
-    if (!launch) {
+export async function getLaunchById(db : D1Database, id : number) : Promise<LaunchWithStatus> {
+    const row = await db.prepare(`SELECT * FROM launches WHERE id = ?`).bind(id).first<LaunchRow>();
+    if (!row) {
         throw new AppError("Launch not found", HttpStatus.NOT_FOUND);
     }
-
-    return {
-        ...launch,
-        status: computeLaunchStatus(launch)
-    };
+    return withStatus(row);
 }
 
-export async function getWhitelistedAddressPerLaunchCount(launchId: number) : Promise<number>{
-    const result = await db.query(`select count(*) from whitelists where launchId = $1`, [launchId]);
-    return parseInt(result.rows[0].count, 10);
+export async function getWhitelistedAddressPerLaunchCount(db : D1Database, launchId : number) : Promise<number> {
+    const row = await db.prepare(`SELECT COUNT(*) AS count FROM whitelists WHERE launchId = ?`).bind(launchId).first<{ count : number }>();
+    return Number(row?.count ?? 0);
 }
 
-export async function insertAddress(launch_id: number, address: string[]) : Promise<{ added: number; total: number }> {
+export async function insertAddress(db : D1Database, launch_id : number, addresses : string[]) : Promise<{ added : number; total : number }> {
 
-    const result : QueryResult<{address: string}> = await db.query(`INSERT INTO whitelists (launchId, address)
-    SELECT $1, unnest($2::text[])
-    ON CONFLICT (address, launchId) DO NOTHING
-    RETURNING address;`,[
-        launch_id, address
-    ])
+    // Postgres had unnest() to insert an array in one go. SQLite does not, so we build
+    // "VALUES (?, ?), (?, ?), ..." ourselves. D1 allows 100 parameters per query,
+    // which is 50 addresses, so bigger lists are split into groups of 50.
+    const statements : D1PreparedStatement[] = [];
+    for (let i = 0; i < addresses.length; i += 50) {
+        const group = addresses.slice(i, i + 50);
+        const values = group.map(() => "(?, ?)").join(", ");
+        statements.push(
+            db.prepare(`INSERT OR IGNORE INTO whitelists (launchId, address) VALUES ${values}`)
+              .bind(...group.flatMap((address) => [launch_id, address]))
+        );
+    }
 
-    const added = result.rowCount ?? 0;
-    const total = await getWhitelistedAddressPerLaunchCount(launch_id);
+    const results = await db.batch(statements);
+    const added = results.reduce((sum, result) => sum + (result.meta.changes ?? 0), 0);
+    const total = await getWhitelistedAddressPerLaunchCount(db, launch_id);
 
     return { added, total };
 }
 
-export async function getWhitelistedAddresses(launch_id : number) : Promise<{address: string}[]> {
-    
-    if(!Number.isInteger(launch_id) || launch_id <= 0){
-        throw new AppError("Invalid Credentials", HttpStatus.BAD_REQUEST);
-    }
-
-    const addressList = await db.query<{address: string}>(`select address from whitelists where launchId = $1`, [launch_id]);
-
-    return addressList.rows;
+export async function getWhitelistedAddresses(db : D1Database, launch_id : number) : Promise<{ address : string }[]> {
+    const { results } = await db.prepare(`SELECT address FROM whitelists WHERE launchId = ? ORDER BY id ASC`).bind(launch_id).all<{ address : string }>();
+    return results;
 }
 
-export async function deleteAddressFromWhitelist(launch_id : number, address : string) : Promise<WhitelistAddress | undefined> {
-    const result = await db.query<WhitelistAddress>(`delete from whitelists where launchId = $1 and address = $2 returning *`, [launch_id, address]);
-    return result.rows[0];
+// true when the whitelist is empty (anyone can buy) or the wallet is on it
+export async function isWalletAllowed(db : D1Database, launch_id : number, walletAddress : string) : Promise<boolean> {
+    const row = await db.prepare(
+        `SELECT COUNT(*) AS total, COALESCE(SUM(address = ?), 0) AS matched FROM whitelists WHERE launchId = ?`
+    ).bind(walletAddress, launch_id).first<{ total : number, matched : number }>();
+    return !row || row.total === 0 || row.matched > 0;
 }
 
-export async function createReferralCode(
-    launchId: number,
-    payload: ReferralPayload
-): Promise<Referral> {
+export async function deleteAddressFromWhitelist(db : D1Database, launch_id : number, address : string) : Promise<WhitelistAddress | null> {
+    return db.prepare(`DELETE FROM whitelists WHERE launchId = ? AND address = ? RETURNING *`).bind(launch_id, address).first<WhitelistAddress>();
+}
+
+export async function createReferralCode(db : D1Database, launchId : number, payload : ReferralPayload) : Promise<Referral> {
     const { code, discountPercent, maxUses } = payload;
     try {
-        const result = await db.query(
+        const row = await db.prepare(
             `INSERT INTO referrals (launchId, code, discountPercent, maxUses, usedCount)
-             VALUES ($1, $2, $3, $4, 0)
-             RETURNING id, launchId, code, discountPercent, maxUses, usedCount`,
-            [launchId, code, discountPercent, maxUses]
-        );
-        const row = result.rows[0];
-        return {
-            id: row.id,
-            launchId: row.launchId,
-            code: row.code,
-            discountPercent: Number(row.discountPercent),
-            maxUses: Number(row.maxUses),
-            usedCount: Number(row.usedCount)
-        };
-    } catch (err: any) {
-        if (err.code === "23505") {
+             VALUES (?, ?, ?, ?, 0)
+             RETURNING id, launchId, code, discountPercent, maxUses, usedCount`
+        ).bind(launchId, code, discountPercent, maxUses).first<Referral>();
+
+        if (!row) {
+            throw new AppError("Could not create referral code", HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+        return row;
+    } catch (err) {
+        if (isUniqueError(err)) {
             throw new AppError("Duplicate referral code for this launch", HttpStatus.CONFLICT);
         }
         throw err;
     }
 }
 
-export async function getReferralsByLaunchId(launchId: number): Promise<Referral[]> {
-    const result = await db.query(
+export async function getReferralsByLaunchId(db : D1Database, launchId : number) : Promise<Referral[]> {
+    const { results } = await db.prepare(
         `SELECT id, launchId, code, discountPercent, maxUses, usedCount
          FROM referrals
-         WHERE launchId = $1
-         ORDER BY id ASC`,
-        [launchId]
-    );
-    return result.rows.map(row => ({
-        id: row.id,
-        launchId: row.launchId,
-        code: row.code,
-        discountPercent: Number(row.discountPercent),
-        maxUses: Number(row.maxUses),
-        usedCount: Number(row.usedCount)
-    }));
+         WHERE launchId = ?
+         ORDER BY id ASC`
+    ).bind(launchId).all<Referral>();
+    return results;
 }
 
-export async function getPurchaseDetails(launch_id : number, tx_signature : string) : Promise<PurchasedDetails | undefined>{
-    if(!launch_id || !tx_signature){
-        throw new AppError("Invalid Credentials", HttpStatus.BAD_REQUEST);
-    }
-
-    const result = await db.query<PurchasedDetails>(`select * from purchases where launchId = $1 and txSignature = $2`, [launch_id, tx_signature]);
-    return result.rows[0];
+export async function getReferralByCode(db : D1Database, launchId : number, code : string) : Promise<Referral | null> {
+    return db.prepare(
+        `SELECT id, launchId, code, discountPercent, maxUses, usedCount FROM referrals WHERE launchId = ? AND code = ?`
+    ).bind(launchId, code).first<Referral>();
 }
 
-export async function getUsersAllPurchasesPerLaunch(launch_id: number, user_id: number) : Promise<PurchasedDetails[]> {
-    
-    if(!launch_id || !user_id || launch_id === 0 || user_id === 0){
-        throw new AppError("Invalid Credentials", HttpStatus.BAD_REQUEST);
-    }
-
-    const result = await db.query<PurchasedDetails>(`select * from purchases where launchId = $1 and userId = $2 order by id asc`, [launch_id, user_id]);
-
-    return result.rows.map(row => ({
-        id: row.id,
-        launchId: row.launchId,
-        txSignature: row.txSignature,
-        userId: row.userId,
-        amount: Number(row.amount),
-        walletAddress: row.walletAddress,
-        totalCost: Number(row.totalCost)
-    }));
+// txSignature is unique across the whole table, not only inside one launch
+export async function isTxSignatureUsed(db : D1Database, tx_signature : string) : Promise<boolean> {
+    const row = await db.prepare(`SELECT id FROM purchases WHERE txSignature = ?`).bind(tx_signature).first();
+    return row !== null;
 }
 
-export async function getAllPurchasesByLaunchId(launch_id: number): Promise<PurchasedDetails[]> {
-    if (!launch_id || launch_id === 0) {
-        throw new AppError("Invalid launch id", HttpStatus.BAD_REQUEST);
-    }
+const PURCHASE_COLUMNS = "id, launchId, txSignature, userId, amount, walletAddress, totalCost";
 
-    const result = await db.query<PurchasedDetails>(
-        `select * from purchases where launchId = $1 order by id asc`,
-        [launch_id]
-    );
-
-    return result.rows.map(row => ({
-        id: row.id,
-        launchId: row.launchId,
-        txSignature: row.txSignature,
-        userId: row.userId,
-        amount: Number(row.amount),
-        walletAddress: row.walletAddress,
-        totalCost: Number(row.totalCost)
-    }));
+export async function getUsersAllPurchasesPerLaunch(db : D1Database, launch_id : number, user_id : number) : Promise<PurchasedDetails[]> {
+    const { results } = await db.prepare(
+        `SELECT ${PURCHASE_COLUMNS} FROM purchases WHERE launchId = ? AND userId = ? ORDER BY id ASC`
+    ).bind(launch_id, user_id).all<PurchasedDetails>();
+    return results;
 }
 
-export async function getSumOfUserPurchases(launch_id: number, user_id: number) : Promise<number>{
-    const result = await db.query<{total: string}>(`SELECT COALESCE(SUM(amount), 0) AS total FROM purchases WHERE launchId = $1 AND userId = $2`, [launch_id, user_id]);
-    return Number(result.rows[0]?.total ?? 0);
+export async function getAllPurchasesByLaunchId(db : D1Database, launch_id : number) : Promise<PurchasedDetails[]> {
+    const { results } = await db.prepare(
+        `SELECT ${PURCHASE_COLUMNS} FROM purchases WHERE launchId = ? ORDER BY id ASC`
+    ).bind(launch_id).all<PurchasedDetails>();
+    return results;
 }
 
-export async function getTiers(launch_id : number) : Promise<Tier[] | undefined> {
-    if(!launch_id || launch_id === 0){
-        throw new AppError("invalid launch id", HttpStatus.BAD_REQUEST);
-    }
-
-    const result = await db.query<Tier[]>(`select tiers from launches where id = $1`, [launch_id]);
-    return result.rows[0];
+export async function getSumOfUserPurchases(db : D1Database, launch_id : number, user_id : number) : Promise<number> {
+    const row = await db.prepare(
+        `SELECT COALESCE(SUM(amount), 0) AS total FROM purchases WHERE launchId = ? AND userId = ?`
+    ).bind(launch_id, user_id).first<{ total : number }>();
+    return Number(row?.total ?? 0);
 }
 
-export async function recordPurchase(params: {
-    launchId: number;
-    userId: number;
-    walletAddress: string;
-    amount: number;
-    totalCost: number;
-    txSignature: string;
-    referralCode?: string | undefined;
-}): Promise<PurchasedDetails> {
+export async function recordPurchase(db : D1Database, params : {
+    launchId : number;
+    userId : number;
+    walletAddress : string;
+    amount : number;
+    totalCost : number;
+    txSignature : string;
+    referralCode? : string | undefined;
+}) : Promise<PurchasedDetails> {
     const { launchId, userId, walletAddress, amount, totalCost, txSignature, referralCode } = params;
 
-    let result : QueryResult<PurchasedDetails>;
-    try {
-        result = await db.query<PurchasedDetails>(
+    const statements = [
+        db.prepare(
             `INSERT INTO purchases (launchId, userId, walletAddress, amount, totalCost, txSignature)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             RETURNING id, launchId, txSignature, userId, amount, walletAddress, totalCost`,
-            [launchId, userId, walletAddress, amount, totalCost, txSignature]
+             VALUES (?, ?, ?, ?, ?, ?)
+             RETURNING ${PURCHASE_COLUMNS}`
+        ).bind(launchId, userId, walletAddress, amount, totalCost, txSignature),
+        db.prepare(`UPDATE launches SET totalPurchased = totalPurchased + ? WHERE id = ?`).bind(amount, launchId)
+    ];
+
+    if (referralCode) {
+        statements.push(
+            db.prepare(`UPDATE referrals SET usedCount = usedCount + 1 WHERE launchId = ? AND code = ?`).bind(launchId, referralCode)
         );
-    } catch (err : any) {
-        // txSignature is unique across the whole table, not only inside one launch
-        if (err.code === "23505") {
+    }
+
+    // A batch runs as one transaction: if the insert fails, the updates are rolled back too.
+    // (The Express version ran these as three separate queries.)
+    let inserted;
+    try {
+        [inserted] = await db.batch<PurchasedDetails>(statements);
+    } catch (err) {
+        if (isUniqueError(err)) {
             throw new AppError("Transaction already exists", HttpStatus.BAD_REQUEST);
         }
         throw err;
     }
 
-    await db.query(
-        `UPDATE launches SET totalPurchased = totalPurchased + $1 WHERE id = $2`,
-        [amount, launchId]
-    );
-
-    if (referralCode) {
-        await db.query(
-            `UPDATE referrals SET usedCount = usedCount + 1 WHERE launchId = $1 AND code = $2`,
-            [launchId, referralCode]
-        );
-    }
-
-    const row = result.rows[0];
+    const row = inserted?.results[0];
     if (!row) {
         throw new AppError("Failed to record purchase", HttpStatus.INTERNAL_SERVER_ERROR);
     }
-
-    return {
-        id: row.id,
-        launchId: row.launchId,
-        txSignature: row.txSignature,
-        userId: row.userId,
-        amount: Number(row.amount),
-        walletAddress: row.walletAddress,
-        totalCost: Number(row.totalCost)
-    };
+    return row;
 }
 
-export async function getWalletPurchasedTotal(launchId: number, walletAddress: string): Promise<number> {
-    const result = await db.query<{ total: string }>(
-        `SELECT COALESCE(SUM(amount), 0) AS total 
-         FROM purchases 
-         WHERE launchId = $1 AND walletAddress = $2`,
-        [launchId, walletAddress]
-    );
-
-    return Number(result.rows[0]?.total ?? 0);
+export async function getWalletPurchasedTotal(db : D1Database, launchId : number, walletAddress : string) : Promise<number> {
+    const row = await db.prepare(
+        `SELECT COALESCE(SUM(amount), 0) AS total FROM purchases WHERE launchId = ? AND walletAddress = ?`
+    ).bind(launchId, walletAddress).first<{ total : number }>();
+    return Number(row?.total ?? 0);
 }
 
 export function calculateVestingSchedule(
-    totalPurchased: number,
-    launch: LaunchWithStatus
-): VestingSchedule {
+    totalPurchased : number,
+    launch : LaunchWithStatus
+) : VestingSchedule {
 
-    if(!launch.vesting){
+    if (!launch.vesting) {
         return {
             totalPurchased,
             tgeAmount : totalPurchased,
@@ -370,7 +326,7 @@ export function calculateVestingSchedule(
     const now = Date.now();
     let linearVested = 0;
 
-    if(now >= cliffEndTime){
+    if (now >= cliffEndTime) {
         const vestingDurationMs = vestingDays * 86400 * 1000;
         const timeSinceCliff = now - cliffEndTime;
         const remainingTokens = totalPurchased - tgeAmount;
@@ -396,16 +352,12 @@ export function calculateVestingSchedule(
     };
 }
 
-export async function updateLaunch(id: number, payload: Partial<LaunchPayload>): Promise<LaunchWithStatus> {
-    const existingResult = await db.query<Launch>(
-        `SELECT * FROM launches WHERE id = $1`,
-        [id]
-    );
-
-    const existing = existingResult.rows[0];
-    if (!existing) {
+export async function updateLaunch(db : D1Database, id : number, payload : Partial<LaunchPayload>) : Promise<LaunchWithStatus> {
+    const existingRow = await db.prepare(`SELECT * FROM launches WHERE id = ?`).bind(id).first<LaunchRow>();
+    if (!existingRow) {
         throw new AppError("Launch not found", HttpStatus.NOT_FOUND);
     }
+    const existing = toLaunch(existingRow);
 
     const name = payload.name ?? existing.name;
     const symbol = payload.symbol ?? existing.symbol;
@@ -413,11 +365,11 @@ export async function updateLaunch(id: number, payload: Partial<LaunchPayload>):
     const totalSupply = payload.totalSupply !== undefined ? payload.totalSupply : existing.totalSupply;
     const pricePerToken = payload.pricePerToken !== undefined ? payload.pricePerToken : existing.pricePerToken;
     const imageUrl = payload.imageUrl !== undefined ? payload.imageUrl : (existing.imageUrl ?? null);
-    const startsAt = payload.startsAt ?? existing.startsAt;
-    const endsAt = payload.endsAt ?? existing.endsAt;
+    const startsAt = toIso(payload.startsAt ?? existing.startsAt);
+    const endsAt = toIso(payload.endsAt ?? existing.endsAt);
     const maxPerWallet = payload.maxPerWallet !== undefined ? payload.maxPerWallet : existing.maxPerWallet;
-    const tiers = payload.tiers !== undefined ? (payload.tiers ? JSON.stringify(payload.tiers) : null) : (existing.tiers ? JSON.stringify(existing.tiers) : null);
-    const vesting = payload.vesting !== undefined ? (payload.vesting ? JSON.stringify(payload.vesting) : null) : (existing.vesting ? JSON.stringify(existing.vesting) : null);
+    const tiers = payload.tiers !== undefined ? payload.tiers : existing.tiers;
+    const vesting = payload.vesting !== undefined ? payload.vesting : existing.vesting;
 
     if (new Date(endsAt) <= new Date(startsAt)) {
         throw new AppError("endsAt must be after startsAt", HttpStatus.BAD_REQUEST);
@@ -426,47 +378,38 @@ export async function updateLaunch(id: number, payload: Partial<LaunchPayload>):
         throw new AppError("totalSupply cannot be less than what is already purchased", HttpStatus.BAD_REQUEST);
     }
 
-    let result : QueryResult<Launch>;
+    let updated : LaunchRow | null;
     try {
-    result = await db.query<Launch>(
-        `UPDATE launches
-         SET name = $1, symbol = $2, description = $3, totalSupply = $4, pricePerToken = $5,
-             startsAt = $6, endsAt = $7, maxPerWallet = $8, tiers = $9, vesting = $10, imageUrl = $11
-         WHERE id = $12
-         RETURNING *`,
-        [name, symbol, description, totalSupply, pricePerToken, startsAt, endsAt, maxPerWallet, tiers, vesting, imageUrl, id]
-    );
-    } catch (err : any) {
-        if (err.code === "23505") {
+        updated = await db.prepare(
+            `UPDATE launches
+             SET name = ?, symbol = ?, description = ?, totalSupply = ?, pricePerToken = ?,
+                 startsAt = ?, endsAt = ?, maxPerWallet = ?, tiers = ?, vesting = ?, imageUrl = ?
+             WHERE id = ?
+             RETURNING *`
+        ).bind(
+            name, symbol, description, totalSupply, pricePerToken, startsAt, endsAt, maxPerWallet,
+            tiers ? JSON.stringify(tiers) : null,
+            vesting ? JSON.stringify(vesting) : null,
+            imageUrl,
+            id
+        ).first<LaunchRow>();
+    } catch (err) {
+        if (isUniqueError(err)) {
             throw new AppError("A launch with this symbol already exists", HttpStatus.CONFLICT);
         }
         throw err;
     }
 
-    const updated = result.rows[0];
     if (!updated) {
         throw new AppError("Failed to update launch", HttpStatus.INTERNAL_SERVER_ERROR);
     }
-
-    return {
-        ...updated,
-        status: computeLaunchStatus(updated)
-    };
+    return withStatus(updated);
 }
 
-export async function setLaunchImage(id: number, imageUrl: string): Promise<LaunchWithStatus> {
-    const result = await db.query<Launch>(
-        `UPDATE launches SET imageUrl = $1 WHERE id = $2 RETURNING *`,
-        [imageUrl, id]
-    );
-
-    const updated = result.rows[0];
+export async function setLaunchImage(db : D1Database, id : number, imageUrl : string) : Promise<LaunchWithStatus> {
+    const updated = await db.prepare(`UPDATE launches SET imageUrl = ? WHERE id = ? RETURNING *`).bind(imageUrl, id).first<LaunchRow>();
     if (!updated) {
         throw new AppError("Launch not found", HttpStatus.NOT_FOUND);
     }
-
-    return {
-        ...updated,
-        status: computeLaunchStatus(updated)
-    };
+    return withStatus(updated);
 }

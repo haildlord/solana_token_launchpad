@@ -35,3 +35,8 @@ keypairs/
 id.json
 # uploaded token images
 uploads/
+
+# cloudflare / wrangler
+.wrangler/
+.dev.vars
+!.dev.vars.example

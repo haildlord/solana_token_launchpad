@@ -32,8 +32,8 @@ export interface LaunchPayload {
     maxPerWallet    : number,
     description     : string,
     imageUrl?       : string | null | undefined,
-    tiers?          : Tier[] | undefined,
-    vesting?        : Vesting | undefined
+    tiers?          : Tier[] | null | undefined,
+    vesting?        : Vesting | null | undefined
 }
 
 export interface Launch extends LaunchPayload {
